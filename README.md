@@ -10,7 +10,7 @@ ASAN-instrumented fuzzer build of **Chrome's libpng** — the PNG decoder Chrome
 
 `track.yml` polls Chrome stable **daily** and resolves the libpng SHA Chrome actually ships (Chrome DEPS → PDFium DEPS). Unchanged → nothing happens. Changed → bump + tag `chrome-<version>` → `build.yml` runs → new Release.
 
-> Requires a `TRACK_TOKEN` PAT (`contents: write`) so the tracker's push starts the build.
+> No PAT or secret needed — the tracker runs on the default `GITHUB_TOKEN` and dispatches the build via `workflow_dispatch`.
 
 ```bash
 git tag v1 && git push origin v1   # manual trigger
