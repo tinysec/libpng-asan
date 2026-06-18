@@ -194,24 +194,25 @@ jobs:
           # EXE would fail with undefined __asan_init because the runtime is not
           # on the try-compile link line.
           ZEXTRA+=(-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY)
-          # zlib ALWAYS builds a STATIC archive alongside its shared lib
-          # (the `zlibstatic` target -> zlibstatic.lib on MSVC / libz.a on
-          # Linux), regardless of BUILD_SHARED_LIBS (verified: zlib still emits
-          # libz.so under -DBUILD_SHARED_LIBS=OFF). The libfuzzer pass links
-          # that static archive directly into each self-contained fuzz exe (no
-          # zlib DLL/so to ship). find_package(ZLIB) in the asan pass links the
-          # shared lib into png_shared.dll, which is fine.
-          # Resolve the install + build dirs as NATIVE paths BEFORE handing them
-          # to cmake. Git-Bash $PWD is the MSYS form (/d/a/...). MSYS path
-          # translation skips values embedded in a -DVAR=... arg, so native
-          # cmake.exe would receive the literal /d/a/... and read it as
-          # <currentdrive>:/d/a/... = D:/d/a/... -- a DOUBLED, bogus path
-          # OUTSIDE the real workspace (D:/a/...). zlib then installs to that
-          # bogus location while every downstream reference points at the real
-          # D:/a/... path, so find_package(ZLIB) and the clang-cl fuzz link both
-          # miss it. cygpath -m yields the mixed D:/a/... form that both cmake
-          # and clang-cl read correctly. On Linux $PWD is already native, so no
-          # conversion is needed.
+          # Build ONLY the STATIC zlib target (`zlibstatic`). zlib's CMake also
+          # defines a SHARED `zlib` target (zlibd.dll / libz.so); building it is
+          # what failed round 5 on Windows -- the shared DLL links via
+          # `cmake -E vs_link_dll ... lld-link`, which IGNORES -fsanitize=address,
+          # so its ASAN-instrumented objects hit undefined __asan_* symbols.
+          # Neither libpng pass needs the shared zlib (both link the static
+          # archive), so build just `zlibstatic` and skip the shared target and
+          # the `install` that builds it.
+          # CMAKE_BUILD_TYPE is left unset: the empty (non-Debug) config avoids
+          # the `d` debug postfix (zlibstaticd.lib) on MSVC, keeping the archive
+          # name stable across platforms.
+          #
+          # Resolve the build dir as a NATIVE path. Git-Bash $PWD is the MSYS
+          # form (/d/a/...). MSYS path translation skips values embedded in a
+          # -DVAR=... arg, so native cmake.exe would receive the literal
+          # /d/a/... and read it as <currentdrive>:/d/a/... = D:/d/a/... -- a
+          # DOUBLED, bogus path outside the real workspace. cygpath -m yields the
+          # mixed D:/a/... form that both cmake and clang-cl read correctly. On
+          # Linux $PWD is already native, so no conversion is needed.
           ZROOT="$PWD/zlib-install"
           ZBUILD="$PWD/zlib-build"
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -220,25 +221,32 @@ jobs:
           fi
           cmake -S zlib-src -B zlib-build -G Ninja "${ZEXTRA[@]}" \
             -DCMAKE_INSTALL_PREFIX="$ZROOT"
-          cmake --build zlib-build --target install
-          echo "ZLIB_INSTALL=$ZROOT" >> "$GITHUB_ENV"
-          # Locate the static archive. Use [ -f ] tests -- NOT `ls A B | head`:
-          # under GHA's `set -e -o pipefail`, an `ls` over a mix of present and
-          # absent names exits non-zero and aborts the step (before this guard
-          # even runs), which is what failed every matrix leg in round 4. The
-          # install rule may not place the static lib in lib/ on MSVC, so search
-          # BOTH the install lib dir and the Ninja build tree, across name
-          # variants, and export the first existing match (install dir first).
+          cmake --build zlib-build --target zlibstatic
+
+          # Stage the static archive + public headers into a clean, predictable
+          # layout that both passes (find_package(ZLIB) and the direct fuzz
+          # link) consume. We did not run `install`, so assemble it by hand.
+          mkdir -p "$ZROOT/include" "$ZROOT/lib"
+          cp zlib-src/zlib.h "$ZROOT/include/"
+          cp zlib-src/zconf.h "$ZROOT/include/"
+
+          # Resolve the single static archive in the build tree. Only
+          # zlibstatic was built, so exactly one match exists; the list covers
+          # the platform name variants (MSVC: zlibstatic.lib; Linux: libz*.a)
+          # and tolerates the `d` debug postfix if it ever reappears. Use
+          # [ -f ] tests -- NOT `ls A B | head`: under GHA's `set -e -o
+          # pipefail` an `ls` over a mix of present and absent names exits
+          # non-zero and aborts the step before this guard runs (round 4).
           ZLIB_STATIC=""
           for cand in \
-            "$ZROOT"/lib/zlibstatic.lib "$ZBUILD"/zlibstatic.lib \
-            "$ZROOT"/lib/zlib.lib       "$ZBUILD"/zlib.lib \
-            "$ZROOT"/lib/libz.a         "$ZBUILD"/libz.a \
-            "$ZROOT"/lib/libzstatic.a   "$ZBUILD"/libzstatic.a; do
+            "$ZBUILD"/zlibstatic.lib "$ZBUILD"/zlibstaticd.lib \
+            "$ZBUILD"/libzlibstatic.a "$ZBUILD"/libz.a; do
             if [ -f "$cand" ]; then ZLIB_STATIC="$cand"; break; fi
           done
-          test -n "$ZLIB_STATIC" || { echo "static zlib not found under $ZROOT/lib or $ZBUILD"; ls -la "$ZROOT/lib" "$ZBUILD" 2>/dev/null; exit 1; }
-          echo "ZLIB_STATIC=$ZLIB_STATIC" >> "$GITHUB_ENV"
+          test -n "$ZLIB_STATIC" || { echo "static zlib not found in $ZBUILD"; ls -la "$ZBUILD" 2>/dev/null; exit 1; }
+          cp "$ZLIB_STATIC" "$ZROOT/lib/"
+          echo "ZLIB_INSTALL=$ZROOT" >> "$GITHUB_ENV"
+          echo "ZLIB_STATIC=$ZROOT/lib/$(basename "$ZLIB_STATIC")" >> "$GITHUB_ENV"
 
       # ----------------------------------------------------------------------
       # PASS A: ASAN static + dynamic libraries (clean, no fuzzer coverage).
