@@ -120,7 +120,15 @@ jobs:
             echo "ASAN_CFLAGS=-fsanitize=address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
             echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
             echo "FUZZ_LINKFLAGS=-fsanitize=fuzzer,address /DEBUG" >> "$GITHUB_ENV"
-            echo "CXX_EXTRA=/EHsc" >> "$GITHUB_ENV"
+            # /EHsc enables C++ exception handling for the harness compile.
+            # -Dssize_t=__int64: the oss-fuzz helper nalloc.h (included by some
+            # libpng_*_fuzzer.cc) declares allocator wrappers taking ssize_t --
+            # a POSIX type MSVC/clang-cl does NOT define, so those harnesses
+            # fail with "unknown type name 'ssize_t'" (e.g. libpng_read_fuzzer).
+            # Define it as __int64 (8-byte signed, == SSIZE_T on Win64) so they
+            # compile. CXX_EXTRA is applied only to the harness .cc compile, not
+            # to the png .c core (which never uses ssize_t).
+            echo "CXX_EXTRA=/EHsc -Dssize_t=__int64" >> "$GITHUB_ENV"
 
             # The shipped Windows LLVM (20.1.x) provides ONLY the DYNAMIC ASAN
             # runtime: clang_rt.asan_dynamic-x86_64.dll + its import lib + the
