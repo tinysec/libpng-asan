@@ -67,17 +67,25 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # clang-cl and cmake are preinstalled on windows-latest; ninja is not.
+          # ninja is not preinstalled on windows-latest.
           choco install ninja -y --no-progress
+          # The clang-cl already on PATH is the VS-bundled REDUCED LLVM, which
+          # omits the sanitizer runtimes (clang_rt.asan-x86_64.lib and the
+          # fuzzer runtime) that the ASAN DLL and the libFuzzer exes must link.
+          # Install a COMPLETE LLVM (full runtime set); the toolchain step pins
+          # CC/CXX to it explicitly so PATH reordering by msvc-dev-cmd cannot
+          # revert us to the reduced build.
+          choco install llvm -y --no-progress
 
       - name: Fetch upstream libpng source (Chrome-vendored release)
         shell: bash
         run: |
           git clone --depth 1 --branch "v${{ steps.ver.outputs.libpng_version }}" "$UPSTREAM_REPO" src
 
-      # MSVC env is set up BEFORE the toolchain step so that LIB is already
-      # populated when the toolchain step prepends the ASAN runtime directory
-      # to it (lld-link searches LIB for the runtime).
+      # MSVC env is set up BEFORE the toolchain step so the SDK libraries are
+      # on LIB and the MSVC headers on INCLUDE for the clang-cl + /MT build.
+      # The ASAN runtime itself is passed as an absolute path on the link line
+      # (see the toolchain step), not via LIB.
       - name: Set up MSVC environment (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -98,8 +106,16 @@ jobs:
           # probes would otherwise compile with the default /MD, which clang-cl
           # rejects under -fsanitize=address ("ASAN requires static CRT").
           if [ "$RUNNER_OS" = "Windows" ]; then
-            echo "CC=clang-cl" >> "$GITHUB_ENV"
-            echo "CXX=clang-cl" >> "$GITHUB_ENV"
+            # Pin CC/CXX to the COMPLETE LLVM installed in the deps step
+            # (C:\Program Files\LLVM). The bare 'clang-cl' on PATH is the
+            # VS-bundled REDUCED LLVM, which omits the ASAN/fuzzer runtimes, so
+            # -print-file-name returns a bare name and the DLL/fuzz-exe links
+            # fail. The explicit path is immune to PATH reordering by
+            # msvc-dev-cmd, and keeps the compiler and the ASAN runtime from
+            # the same LLVM (matching ABI).
+            CLANG_CL="C:/Program Files/LLVM/bin/clang-cl.exe"
+            echo "CC=$CLANG_CL" >> "$GITHUB_ENV"
+            echo "CXX=$CLANG_CL" >> "$GITHUB_ENV"
             echo "OBJEXT=obj" >> "$GITHUB_ENV"
             echo "ASAN_CFLAGS=-fsanitize=address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
             echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
@@ -107,22 +123,27 @@ jobs:
             echo "CXX_EXTRA=/EHsc" >> "$GITHUB_ENV"
 
             # The shared library (png_shared.dll) is ASAN-instrumented, so its
-            # link must resolve the static ASAN runtime (__asan_set_shadow_* and
-            # friends). clang-cl as the link driver does not reliably add the
-            # STATIC runtime for a DLL, so provide it explicitly as a FULL
-            # ABSOLUTE PATH on the link line. We pass the absolute path (not a
-            # bare lib name plus a LIB search dir) because CMake space-splits
-            # linker flags and the runtime's real home ("C:\Program Files\...")
-            # contains a space that breaks lld-link's name resolution. The GHA
-            # workspace has no spaces, so copy the runtime there first.
-            # -fsanitize=address is dropped from the link so clang-cl does not
-            # add a second (dynamic) runtime; this explicit static lib is the
-            # single source of the ASAN symbols.
-            ASAN_RT=$(clang-cl -print-file-name=clang_rt.asan_static-x86_64.lib)
-            test -f "$ASAN_RT" || { echo "ASAN static runtime not found: $ASAN_RT"; exit 1; }
+            # link must resolve the static ASAN runtime (__asan_set_shadow_*).
+            # clang-cl as the link driver does not reliably add the STATIC
+            # runtime for a DLL, so provide it explicitly as a FULL ABSOLUTE
+            # PATH on the link line. CMake space-splits linker flags and the
+            # runtime's home ("C:\Program Files\...") contains a space, so copy
+            # the runtime into the space-free GHA workspace and pass its
+            # forward-slash absolute path; lld-link loads an absolute path
+            # directly, no name resolution needed.
+            # Try both Windows runtime names: the canonical clang_rt.asan-
+            # x86_64.lib and the clang_rt.asan_static-x86_64.lib variant.
+            # -print-file-name echoes the query back unchanged when the file is
+            # absent, so reject that case explicitly.
+            ASAN_RT=""
+            for rtname in clang_rt.asan_static-x86_64.lib clang_rt.asan-x86_64.lib; do
+              cand=$("$CLANG_CL" -print-file-name="$rtname")
+              if [ "$cand" != "$rtname" ] && [ -f "$cand" ]; then
+                ASAN_RT="$cand"; break
+              fi
+            done
+            test -n "$ASAN_RT" || { echo "ASAN static runtime not found via $CLANG_CL"; exit 1; }
             cp "$ASAN_RT" "$GITHUB_WORKSPACE/asan_static_rt.lib"
-            # Forward slashes so the path survives CMake's space-splitting as a
-            # single token; lld-link accepts forward slashes.
             WS_FWD=$(echo "$GITHUB_WORKSPACE" | sed 's|\\|/|g')
             echo "ASAN_LDFLAGS=/DEBUG ${WS_FWD}/asan_static_rt.lib" >> "$GITHUB_ENV"
           else
@@ -149,7 +170,7 @@ jobs:
           git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git zlib-src
           ZEXTRA=()
           if [ "$RUNNER_OS" = "Windows" ]; then
-            ZEXTRA+=(-DCMAKE_C_COMPILER=clang-cl -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
+            ZEXTRA+=(-DCMAKE_C_COMPILER="$CC" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
           else
             ZEXTRA+=(-DCMAKE_C_COMPILER="$CC")
           fi
