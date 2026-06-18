@@ -10,10 +10,9 @@ on:
         required: false
 
 env:
-  # Chrome's libpng fork + the exact SHA Chrome 149 ships. Bumped automatically
-  # by track.yml (resolves latest Chrome stable -> PDFium DEPS -> libpng).
+  # Chrome's libpng fork. The Chrome-locked SHA lives in chrome.lock (written by
+  # track.yml) so the default token can push bumps without touching this file.
   REPO: https://chromium.googlesource.com/chromium/src/third_party/libpng.git
-  REF: 367bb5ca4af50342f709f444af04002527ce8b0f
   OSS_FUZZ_HARNESS_URL: https://raw.githubusercontent.com/google/oss-fuzz/master/projects/libpng/libpng_read_fuzzer.c
   AFL_BRANCH: stable
 
@@ -35,6 +34,12 @@ jobs:
       - name: Checkout this repository
         uses: actions/checkout@v4
 
+      - name: Read Chrome-locked revision from chrome.lock
+        id: lock
+        shell: bash
+        run: |
+          echo "sha=$(jq -r .sha chrome.lock)" >> "$GITHUB_OUTPUT"
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -55,7 +60,7 @@ jobs:
         shell: bash
         run: |
           git clone --no-checkout "$REPO" src
-          git -C src fetch --depth 1 origin "$REF"
+          git -C src fetch --depth 1 origin "${{ steps.lock.outputs.sha }}"
           git -C src checkout FETCH_HEAD
 
       - name: Fetch upstream OSS-Fuzz harness (libpng_read_fuzzer)
