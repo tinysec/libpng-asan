@@ -10,11 +10,12 @@ on:
         required: false
 
 env:
-  # Chrome's libpng fork. The Chrome-locked SHA lives in chrome.lock (written by
-  # track.yml) so the default token can push bumps without touching this file.
-  # NOTE: Chrome's fork ships only BUILD.gn (no CMakeLists.txt), so we compile
-  # the shipped C sources directly rather than driving a CMake build.
-  REPO: https://chromium.googlesource.com/chromium/src/third_party/libpng.git
+  # Chrome vendors libpng; its fork ships only BUILD.gn (no CMakeLists.txt).
+  # We read the fork's version (PNG_LIBPNG_VER_STRING) and build the matching
+  # UPSTREAM libpng release with its native CMake -- the same approach as
+  # libjpeg-turbo. The upstream tree also ships the contrib/oss-fuzz harnesses.
+  FORK_REPO: https://chromium.googlesource.com/chromium/src/third_party/libpng.git
+  UPSTREAM_REPO: https://github.com/pnggroup/libpng.git
 
 jobs:
   build:
@@ -23,9 +24,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # libFuzzer only. AFL++ (afl-clang-fast) is Linux-native and cannot run
-        # on Windows; Windows AFL++ fuzzing is handled separately via WinAFL.
+        # Two matrix dimensions => 4 parallel jobs:
+        #   os   : Linux and Windows build independently and concurrently.
+        #   mode : the (slow) ASAN-library compile and the libFuzzer compile
+        #          run as separate parallel legs instead of one after the other.
+        # Each leg ships one ASAN-instrumented artifact:
+        #   asan      -> static + dynamic libraries (link into your own harness)
+        #   libfuzzer -> self-contained libFuzzer binaries (libFuzzer engine)
         os: [ubuntu-latest, windows-latest]
+        mode: [asan, libfuzzer]
 
     steps:
       - name: Checkout this repository
@@ -37,54 +44,67 @@ jobs:
         run: |
           echo "sha=$(jq -r .sha chrome.lock)" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve the libpng release Chrome vendors
+        id: ver
+        shell: bash
+        run: |
+          # PNG_LIBPNG_VER_STRING lives in the Chrome fork's png.h; it is the
+          # upstream release tag Chrome vendors (e.g. "1.6.58" -> v1.6.58).
+          HDR=$(curl -fsSL "${FORK_REPO}/+/${{ steps.lock.outputs.sha }}/png.h?format=TEXT" | base64 -d)
+          PNG_VER=$(printf '%s\n' "$HDR" | sed -nE 's/#define[[:space:]]+PNG_LIBPNG_VER_STRING[[:space:]]+"([^"]+)"/\1/p' | head -1)
+          test -n "$PNG_VER" || { echo "could not determine libpng version from fork header"; exit 1; }
+          echo "libpng_version=$PNG_VER" >> "$GITHUB_OUTPUT"
+          echo "Resolved Chrome libpng version: $PNG_VER"
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential zlib1g-dev git ca-certificates curl clang
+            build-essential cmake ninja-build zlib1g-dev git ca-certificates curl clang
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # clang-cl and the MSVC toolchain are preinstalled on windows-latest.
-          # ninja is needed to build zlib from source in a later Windows step.
+          # clang-cl and cmake are preinstalled on windows-latest; ninja is not.
           # zlib is built from source rather than via vcpkg: on current images
-          # VCPKG_ROOT points at an empty VS-bundled clone, so a vcpkg install
-          # does not land where $VCPKG_ROOT expects.
+          # VCPKG_ROOT points at an empty VS-bundled clone, so vcpkg lookups fail.
           choco install ninja -y --no-progress
 
-      - name: Fetch libpng source (Chrome-locked revision)
+      - name: Fetch upstream libpng source (Chrome-vendored release)
         shell: bash
         run: |
-          git clone --no-checkout "$REPO" src
-          git -C src fetch --depth 1 origin "${{ steps.lock.outputs.sha }}"
-          git -C src checkout FETCH_HEAD
+          git clone --depth 1 --branch "v${{ steps.ver.outputs.libpng_version }}" "$UPSTREAM_REPO" src
 
-      - name: Resolve the libFuzzer toolchain
+      - name: Resolve the ASAN + libFuzzer toolchain
         shell: bash
         run: |
-          # The harness (src/contrib/oss-fuzz/libpng_read_fuzzer.cc) is C++, so a
-          # C++ compiler is required in addition to the C compiler that builds libpng.
+          # Two flag sets:
+          #   ASAN_*  -> library pass: ASAN memory checks only, clean lib.
+          #   FUZZ_*  -> libFuzzer pass: ASAN + SanitizerCoverage (fuzzer-no-link)
+          #              on the lib/harness, then -fsanitize=fuzzer at link pulls
+          #              libFuzzer's main() and engine.
+          # /MT pins the static CRT so lib objects, the from-source zlib, and the
+          # ASAN/libFuzzer runtimes all share one CRT (required for clang-cl).
           if [ "$RUNNER_OS" = "Windows" ]; then
             echo "CC=clang-cl" >> "$GITHUB_ENV"
             echo "CXX=clang-cl" >> "$GITHUB_ENV"
             echo "OBJEXT=obj" >> "$GITHUB_ENV"
-            # /Zi + /DEBUG emit a side .pdb so ASAN stacks resolve to source.
-            # /MT pins the static CRT so libpng objects, the harness, and the
-            # from-source zlib all share one CRT -- required for clang-cl ASAN on
-            # Windows. /Zi + /DEBUG emit a side .pdb so ASAN stacks resolve to src.
-            echo "LIB_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
-            echo "HARNESS_CFLAGS=-fsanitize=fuzzer,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
-            echo "HARNESS_EXTRA=-EHsc" >> "$GITHUB_ENV"
+            echo "ASAN_CFLAGS=-fsanitize=address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
+            echo "ASAN_LDFLAGS=-fsanitize=address /DEBUG" >> "$GITHUB_ENV"
+            echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
+            echo "FUZZ_LINKFLAGS=-fsanitize=fuzzer,address /DEBUG" >> "$GITHUB_ENV"
+            echo "CXX_EXTRA=/EHsc" >> "$GITHUB_ENV"
           else
             echo "CC=clang" >> "$GITHUB_ENV"
             echo "CXX=clang++" >> "$GITHUB_ENV"
             echo "OBJEXT=o" >> "$GITHUB_ENV"
-            echo "LIB_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1" >> "$GITHUB_ENV"
-            echo "HARNESS_CFLAGS=-fsanitize=fuzzer,address -g -O1" >> "$GITHUB_ENV"
-            echo "HARNESS_EXTRA=" >> "$GITHUB_ENV"
+            echo "ASAN_CFLAGS=-fsanitize=address -g -O1" >> "$GITHUB_ENV"
+            echo "ASAN_LDFLAGS=-fsanitize=address" >> "$GITHUB_ENV"
+            echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1" >> "$GITHUB_ENV"
+            echo "FUZZ_LINKFLAGS=-fsanitize=fuzzer,address" >> "$GITHUB_ENV"
+            echo "CXX_EXTRA=" >> "$GITHUB_ENV"
           fi
 
       - name: Set up MSVC environment (Windows)
@@ -100,9 +120,7 @@ jobs:
           MSYS_NO_PATHCONV: "1"
         run: |
           # Build zlib locally with the static CRT (/MT) so it shares one CRT
-          # with the clang-cl ASAN libpng objects and harness (required for
-          # clang-cl ASAN on Windows). From-source avoids the vcpkg/VCPKG_ROOT
-          # image-churn problem noted in the deps step.
+          # with the clang-cl ASAN libpng objects (required for clang-cl ASAN).
           git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git zlib-src
           cmake -S zlib-src -B zlib-build -G Ninja \
             -DCMAKE_C_COMPILER=clang-cl \
@@ -111,20 +129,67 @@ jobs:
           cmake --build zlib-build --target install
           echo "ZLIB_INSTALL=$PWD/zlib-install" >> "$GITHUB_ENV"
 
-      - name: Build libpng objects and the harness
+      # ----------------------------------------------------------------------
+      # PASS A: ASAN static + dynamic libraries (clean, no fuzzer coverage).
+      # ----------------------------------------------------------------------
+      - name: Build libpng static + dynamic (ASAN)
+        if: matrix.mode == 'asan'
         shell: bash
         env:
-          # Stop Git-bash from rewriting clang-cl "/Zi" and "/DEBUG" flags into
-          # C:/Program Files/Git/Zi paths (the classic MSYS arg-conversion bug).
           MSYS_NO_PATHCONV: "1"
         run: |
-          mkdir -p obj out
+          mkdir -p out/lib/include
 
-          # Resolve the zlib lib/include from vcpkg once, up front, so both the
-          # object-compile loop and the harness link step can see them. libpng's
-          # private headers (pngstruct.h) #include "zlib.h", so the zlib include
-          # dir must be on the path when compiling the .c objects, not only when
-          # linking the harness.
+          EXTRA_ARGS=()
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXTRA_ARGS+=(
+              -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+              -DZLIB_ROOT="$ZLIB_INSTALL"
+            )
+          fi
+
+          # PNG_SHARED=ON + PNG_STATIC=ON produce both libraries. PNG_TESTS and
+          # PNG_TOOLS are OFF so nothing links an executable (no harness here).
+          cmake -S src -B build-asan -G Ninja \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_C_FLAGS_INIT="$ASAN_CFLAGS" \
+            -DCMAKE_CXX_FLAGS_INIT="$ASAN_CFLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS_INIT="$ASAN_LDFLAGS" \
+            -DCMAKE_SHARED_LINKER_FLAGS_INIT="$ASAN_LDFLAGS" \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DPNG_SHARED=ON \
+            -DPNG_STATIC=ON \
+            -DPNG_TESTS=OFF \
+            -DPNG_TOOLS=OFF \
+            "${EXTRA_ARGS[@]}"
+          cmake --build build-asan
+
+          # Real library files only (-type f skips Linux .so symlinks).
+          find build-asan -type f \( \
+              -name 'libpng*.a' -o -name 'libpng*.so*' -o \
+              -name 'libpng*.lib' -o -name 'libpng*.dll' -o -name 'libpng*.pdb' \
+            \) -exec cp {} out/lib/ \;
+          cp src/png.h src/pngconf.h out/lib/include/ 2>/dev/null || true
+          cp build-asan/pnglibconf.h out/lib/include/ 2>/dev/null || true
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "$ZLIB_INSTALL"/include/zlib.h "$ZLIB_INSTALL"/include/zconf.h out/lib/include/ 2>/dev/null || true
+          fi
+          ls -la out/lib out/lib/include
+
+      # ----------------------------------------------------------------------
+      # PASS B: libFuzzer binaries (ASAN + coverage + libFuzzer engine).
+      # The harnesses are upstream's public contrib/oss-fuzz/*.cc.
+      # ----------------------------------------------------------------------
+      - name: Build libpng libFuzzer targets
+        if: matrix.mode == 'libfuzzer'
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          mkdir -p obj-fuzz out/fuzz
+
+          # Resolve the zlib lib/include for the link step (Windows only).
           ZLIBLIB=""
           ZLIBINC=""
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -132,8 +197,7 @@ jobs:
             ZLIBINC="$ZLIB_INSTALL/include"
           fi
 
-          # The portable C core of libpng (skip pngtest.c). The Chrome fork ships a
-          # ready-made pnglibconf.h at the root, so no config generation is needed.
+          # The portable C core of libpng, compiled with ASAN + fuzzer coverage.
           PNG_SRCS="src/png.c src/pngerror.c src/pngget.c src/pngmem.c src/pngpread.c \
             src/pngread.c src/pngrio.c src/pngrtran.c src/pngrutil.c src/pngset.c \
             src/pngtrans.c src/pngwio.c src/pngwrite.c src/pngwtran.c src/pngwutil.c"
@@ -141,49 +205,55 @@ jobs:
           for c in $PNG_SRCS; do
             base=$(basename "${c%.c}")
             if [ "$RUNNER_OS" = "Windows" ]; then
-              "$CC" -c $LIB_CFLAGS "$c" -I src -I "$ZLIBINC" -o "obj/${base}.${OBJEXT}"
+              "$CC" -c $FUZZ_CFLAGS "$c" -I src -I "$ZLIBINC" -o "obj-fuzz/${base}.${OBJEXT}"
             else
-              "$CC" -c $LIB_CFLAGS "$c" -I src -o "obj/${base}.${OBJEXT}"
+              "$CC" -c $FUZZ_CFLAGS "$c" -I src -o "obj-fuzz/${base}.${OBJEXT}"
             fi
           done
 
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            "$CXX" $HARNESS_CFLAGS $HARNESS_EXTRA \
-              src/contrib/oss-fuzz/libpng_read_fuzzer.cc \
-              obj/*.o -lz \
-              -I src -I src/contrib/oss-fuzz \
-              -o "out/png_libfuzzer_fuzzer"
-          else
-            "$CXX" $HARNESS_CFLAGS $HARNESS_EXTRA \
-              src/contrib/oss-fuzz/libpng_read_fuzzer.cc \
-              obj/*.o "$ZLIBLIB" \
-              -I src -I src/contrib/oss-fuzz -I "$ZLIBINC" \
-              /DEBUG \
-              -o "out/png_libfuzzer_fuzzer.exe"
-          fi
+          # Each upstream oss-fuzz harness -> one self-contained libFuzzer exe.
+          for h in src/contrib/oss-fuzz/libpng_*_fuzzer.cc; do
+            [ -f "$h" ] || continue
+            name=$(basename "${h%.cc}")
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              "$CXX" $FUZZ_CFLAGS $CXX_EXTRA "$h" obj-fuzz/*.obj "$ZLIBLIB" \
+                $FUZZ_LINKFLAGS \
+                -I src -I src/contrib/oss-fuzz -I "$ZLIBINC" \
+                -o "out/fuzz/${name}.exe"
+            else
+              "$CXX" $FUZZ_CFLAGS $CXX_EXTRA "$h" obj-fuzz/*.o \
+                $FUZZ_LINKFLAGS -lz \
+                -I src -I src/contrib/oss-fuzz \
+                -o "out/fuzz/${name}"
+            fi
+          done
 
-          # Ship the fuzzer dictionary alongside the binary.
-          cp src/contrib/oss-fuzz/png.dict out/png_libfuzzer.dict 2>/dev/null || true
+          # Ship the fuzzer dictionary alongside the binaries.
+          cp src/contrib/oss-fuzz/png.dict out/fuzz/ 2>/dev/null || true
+          ls -la out/fuzz
 
-      - name: Smoke test
+      - name: Verify artifacts
         shell: bash
         run: |
-          # Pick whichever binary name this OS produced (no suffix on Linux,
-          # .exe on Windows). Test each candidate explicitly rather than `ls`ing
-          # both paths -- `ls a b` exits 2 when one path is missing, which under
-          # `set -e -o pipefail` would abort the step even though the binary
-          # built fine.
-          BIN=""
-          for cand in out/png_libfuzzer_fuzzer out/png_libfuzzer_fuzzer.exe; do
-            if [ -f "$cand" ]; then BIN="$cand"; break; fi
-          done
-          "$BIN" -runs=1 >/dev/null 2>&1 || true
+          # Each mode must have produced its own key artifact.
+          if [ "${{ matrix.mode }}" = "asan" ]; then
+            STAT=$(find out/lib -type f \( -name 'libpng*.a' -o -name 'libpng_static*.lib' -o -name 'libpng16*.lib' \) | head -1)
+            DYN=$(find out/lib -type f \( -name 'libpng*.so*' -o -name 'libpng*.dll' \) | head -1)
+            test -n "$STAT" || { echo "ERROR: ASAN static lib missing"; exit 1; }
+            test -n "$DYN"  || { echo "ERROR: ASAN dynamic lib missing"; exit 1; }
+            echo "asan-static:  $STAT"
+            echo "asan-dynamic: $DYN"
+          else
+            FZ=$(find out/fuzz -type f \( -name 'libpng_*_fuzzer' -o -name 'libpng_*_fuzzer.exe' \) | head -1)
+            test -n "$FZ" || { echo "ERROR: libFuzzer binary missing"; exit 1; }
+            echo "libfuzzer: $FZ"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: png-libfuzzer-${{ runner.os }}
-          path: out/*
+          name: png-asan-${{ matrix.mode }}-${{ matrix.os }}
+          path: out
           if-no-files-found: error
 
   release:
