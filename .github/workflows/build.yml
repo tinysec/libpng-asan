@@ -152,6 +152,14 @@ jobs:
           # EXE would fail with undefined __asan_init because the runtime is not
           # on the try-compile link line.
           ZEXTRA+=(-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY)
+          # zlib builds a shared zlibd.dll (Windows) / libz.so (Linux) in
+          # addition to the static lib we actually link against. The
+          # ASAN-instrumented shared lib needs the ASAN runtime at link time:
+          # undefined symbols are tolerated in a Linux .so (resolved at load)
+          # but are a hard link error for a Windows DLL, so feed the runtime to
+          # zlib's shared/exe link flags here.
+          ZEXTRA+=(-DCMAKE_SHARED_LINKER_FLAGS_INIT="$ASAN_LDFLAGS")
+          ZEXTRA+=(-DCMAKE_EXE_LINKER_FLAGS_INIT="$ASAN_LDFLAGS")
           cmake -S zlib-src -B zlib-build -G Ninja "${ZEXTRA[@]}" \
             -DCMAKE_INSTALL_PREFIX="$PWD/zlib-install"
           cmake --build zlib-build --target install
