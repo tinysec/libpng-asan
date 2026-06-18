@@ -147,6 +147,11 @@ jobs:
             ZEXTRA+=(-DCMAKE_C_COMPILER="$CC")
           fi
           ZEXTRA+=(-DCMAKE_C_FLAGS_INIT="$ASAN_CFLAGS")
+          # STATIC_LIBRARY target type makes CMake's compiler test archive the
+          # objects instead of linking an EXE -- an ASAN-instrumented try-compile
+          # EXE would fail with undefined __asan_init because the runtime is not
+          # on the try-compile link line.
+          ZEXTRA+=(-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY)
           cmake -S zlib-src -B zlib-build -G Ninja "${ZEXTRA[@]}" \
             -DCMAKE_INSTALL_PREFIX="$PWD/zlib-install"
           cmake --build zlib-build --target install
