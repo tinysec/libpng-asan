@@ -194,42 +194,50 @@ jobs:
           # EXE would fail with undefined __asan_init because the runtime is not
           # on the try-compile link line.
           ZEXTRA+=(-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY)
-          # Build zlib STATIC. The libfuzzer pass links zlib directly into each
-          # self-contained fuzz exe, so it needs a static archive (no zlib DLL
-          # to drag along). On Windows, zlib's MSVC default builds the SHARED
-          # lib (zlibd.dll + zlibd.lib import) and installs ONLY that, so the
-          # libfuzzer link then fails LNK1181 on zlibstatic.lib. Forcing STATIC
-          # guarantees an archive; find_package(ZLIB) in the asan pass then
-          # links that static zlib into png_shared.dll (baked in -- fine).
-          ZEXTRA+=(-DBUILD_SHARED_LIBS=OFF)
-          # Resolve the install dir as a NATIVE path BEFORE handing it to cmake.
-          # Git-Bash $PWD is the MSYS form (/d/a/...). MSYS path translation
-          # skips values embedded in a -DVAR=... arg, so native cmake.exe would
-          # receive the literal /d/a/... and read it as <currentdrive>:/d/a/...
-          # = D:/d/a/... -- a DOUBLED, bogus path OUTSIDE the real workspace
-          # (D:/a/...). zlib then installs to that bogus location while every
-          # downstream reference points at the real D:/a/... path, so
-          # find_package(ZLIB) and the clang-cl fuzz link both miss it. cygpath
-          # -m yields the mixed D:/a/... form that both cmake and clang-cl read
-          # correctly; use it for BOTH the install prefix and the exported var
-          # so install location and lookup location always agree. On Linux $PWD
-          # is already native, so no conversion is needed.
+          # zlib ALWAYS builds a STATIC archive alongside its shared lib
+          # (the `zlibstatic` target -> zlibstatic.lib on MSVC / libz.a on
+          # Linux), regardless of BUILD_SHARED_LIBS (verified: zlib still emits
+          # libz.so under -DBUILD_SHARED_LIBS=OFF). The libfuzzer pass links
+          # that static archive directly into each self-contained fuzz exe (no
+          # zlib DLL/so to ship). find_package(ZLIB) in the asan pass links the
+          # shared lib into png_shared.dll, which is fine.
+          # Resolve the install + build dirs as NATIVE paths BEFORE handing them
+          # to cmake. Git-Bash $PWD is the MSYS form (/d/a/...). MSYS path
+          # translation skips values embedded in a -DVAR=... arg, so native
+          # cmake.exe would receive the literal /d/a/... and read it as
+          # <currentdrive>:/d/a/... = D:/d/a/... -- a DOUBLED, bogus path
+          # OUTSIDE the real workspace (D:/a/...). zlib then installs to that
+          # bogus location while every downstream reference points at the real
+          # D:/a/... path, so find_package(ZLIB) and the clang-cl fuzz link both
+          # miss it. cygpath -m yields the mixed D:/a/... form that both cmake
+          # and clang-cl read correctly. On Linux $PWD is already native, so no
+          # conversion is needed.
           ZROOT="$PWD/zlib-install"
-          if [ "$RUNNER_OS" = "Windows" ]; then ZROOT=$(cygpath -m "$ZROOT"); fi
+          ZBUILD="$PWD/zlib-build"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ZROOT=$(cygpath -m "$ZROOT")
+            ZBUILD=$(cygpath -m "$ZBUILD")
+          fi
           cmake -S zlib-src -B zlib-build -G Ninja "${ZEXTRA[@]}" \
             -DCMAKE_INSTALL_PREFIX="$ZROOT"
           cmake --build zlib-build --target install
           echo "ZLIB_INSTALL=$ZROOT" >> "$GITHUB_ENV"
-          # The static archive's name varies by platform/MSVC config
-          # (zlibstatic.lib / zlib.lib on Windows, libz.a on Linux), so glob it
-          # out of the install lib dir instead of hardcoding. Export the path so
-          # the libfuzzer pass links the real file regardless of the exact name.
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            ZLIB_STATIC=$(ls "$ZROOT"/lib/zlibstatic.lib "$ZROOT"/lib/zlib.lib 2>/dev/null | head -1)
-          else
-            ZLIB_STATIC=$(ls "$ZROOT"/lib/libz.a "$ZROOT"/lib/libzstatic.a 2>/dev/null | head -1)
-          fi
-          test -n "$ZLIB_STATIC" || { echo "static zlib not found in $ZROOT/lib"; ls -la "$ZROOT/lib"; exit 1; }
+          # Locate the static archive. Use [ -f ] tests -- NOT `ls A B | head`:
+          # under GHA's `set -e -o pipefail`, an `ls` over a mix of present and
+          # absent names exits non-zero and aborts the step (before this guard
+          # even runs), which is what failed every matrix leg in round 4. The
+          # install rule may not place the static lib in lib/ on MSVC, so search
+          # BOTH the install lib dir and the Ninja build tree, across name
+          # variants, and export the first existing match (install dir first).
+          ZLIB_STATIC=""
+          for cand in \
+            "$ZROOT"/lib/zlibstatic.lib "$ZBUILD"/zlibstatic.lib \
+            "$ZROOT"/lib/zlib.lib       "$ZBUILD"/zlib.lib \
+            "$ZROOT"/lib/libz.a         "$ZBUILD"/libz.a \
+            "$ZROOT"/lib/libzstatic.a   "$ZBUILD"/libzstatic.a; do
+            if [ -f "$cand" ]; then ZLIB_STATIC="$cand"; break; fi
+          done
+          test -n "$ZLIB_STATIC" || { echo "static zlib not found under $ZROOT/lib or $ZBUILD"; ls -la "$ZROOT/lib" "$ZBUILD" 2>/dev/null; exit 1; }
           echo "ZLIB_STATIC=$ZLIB_STATIC" >> "$GITHUB_ENV"
 
       # ----------------------------------------------------------------------
@@ -243,7 +251,18 @@ jobs:
         run: |
           mkdir -p out/lib/include
 
+          # Force the STATIC zlib (ZLIB_STATIC, resolved in the zlib step) for
+          # BOTH the shared AND static libpng libs. find_package(ZLIB) with only
+          # ZLIB_ROOT would link the SHARED zlib import lib (zlib.lib on Windows),
+          # leaving png_shared.dll and the static libpng with a runtime dependency
+          # on zlib1.dll -- which we do NOT ship -- so any downstream harness
+          # would fail to load. Pre-setting the find_package(ZLIB) cache vars
+          # (ZLIB_LIBRARY + ZLIB_INCLUDE_DIR) makes find_package accept them
+          # without searching, so every libpng artifact bakes zlib in and is
+          # self-contained. ZLIB_ROOT is kept as a fallback hint.
           EXTRA_ARGS=(-DZLIB_ROOT="$ZLIB_INSTALL")
+          EXTRA_ARGS+=(-DZLIB_LIBRARY="$ZLIB_STATIC")
+          EXTRA_ARGS+=(-DZLIB_INCLUDE_DIR="$ZLIB_INSTALL/include")
           if [ "$RUNNER_OS" = "Windows" ]; then
             EXTRA_ARGS+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
           fi
