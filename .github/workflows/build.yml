@@ -88,8 +88,24 @@ jobs:
 
       - name: Build libpng objects and the harness
         shell: bash
+        env:
+          # Stop Git-bash from rewriting clang-cl "/Zi" and "/DEBUG" flags into
+          # C:/Program Files/Git/Zi paths (the classic MSYS arg-conversion bug).
+          MSYS_NO_PATHCONV: "1"
         run: |
           mkdir -p obj out
+
+          # Resolve the zlib lib/include from vcpkg once, up front, so both the
+          # object-compile loop and the harness link step can see them. libpng's
+          # private headers (pngstruct.h) #include "zlib.h", so the zlib include
+          # dir must be on the path when compiling the .c objects, not only when
+          # linking the harness.
+          ZLIBLIB=""
+          ZLIBINC=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ZLIBLIB=$(ls "$VCPKG_ROOT"/installed/x64-windows-static/lib/zlib*.lib 2>/dev/null | head -1)
+            ZLIBINC="$VCPKG_ROOT/installed/x64-windows-static/include"
+          fi
 
           # The portable C core of libpng (skip pngtest.c). The Chrome fork ships a
           # ready-made pnglibconf.h at the root, so no config generation is needed.
@@ -99,7 +115,11 @@ jobs:
 
           for c in $PNG_SRCS; do
             base=$(basename "${c%.c}")
-            "$CC" -c $LIB_CFLAGS "$c" -I src -o "obj/${base}.${OBJEXT}"
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              "$CC" -c $LIB_CFLAGS "$c" -I src -I "$ZLIBINC" -o "obj/${base}.${OBJEXT}"
+            else
+              "$CC" -c $LIB_CFLAGS "$c" -I src -o "obj/${base}.${OBJEXT}"
+            fi
           done
 
           if [ "$RUNNER_OS" = "Linux" ]; then
@@ -109,8 +129,6 @@ jobs:
               -I src -I src/contrib/oss-fuzz \
               -o "out/png_libfuzzer_fuzzer"
           else
-            ZLIBLIB=$(ls "$VCPKG_ROOT"/installed/x64-windows-static/lib/zlib*.lib 2>/dev/null | head -1)
-            ZLIBINC="$VCPKG_ROOT/installed/x64-windows-static/include"
             "$CXX" $HARNESS_CFLAGS $HARNESS_EXTRA \
               src/contrib/oss-fuzz/libpng_read_fuzzer.cc \
               obj/*.o "$ZLIBLIB" \
