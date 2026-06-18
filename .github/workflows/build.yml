@@ -121,14 +121,7 @@ jobs:
             echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
             echo "FUZZ_LINKFLAGS=-fsanitize=fuzzer,address /DEBUG" >> "$GITHUB_ENV"
             # /EHsc enables C++ exception handling for the harness compile.
-            # -Dssize_t=__int64: the oss-fuzz helper nalloc.h (included by some
-            # libpng_*_fuzzer.cc) declares allocator wrappers taking ssize_t --
-            # a POSIX type MSVC/clang-cl does NOT define, so those harnesses
-            # fail with "unknown type name 'ssize_t'" (e.g. libpng_read_fuzzer).
-            # Define it as __int64 (8-byte signed, == SSIZE_T on Win64) so they
-            # compile. CXX_EXTRA is applied only to the harness .cc compile, not
-            # to the png .c core (which never uses ssize_t).
-            echo "CXX_EXTRA=/EHsc -Dssize_t=__int64" >> "$GITHUB_ENV"
+            echo "CXX_EXTRA=/EHsc" >> "$GITHUB_ENV"
 
             # The shipped Windows LLVM (20.1.x) provides ONLY the DYNAMIC ASAN
             # runtime: clang_rt.asan_dynamic-x86_64.dll + its import lib + the
@@ -363,6 +356,20 @@ jobs:
           # Each upstream oss-fuzz harness -> one self-contained libFuzzer exe.
           for h in src/contrib/oss-fuzz/libpng_*_fuzzer.cc; do
             [ -f "$h" ] || continue
+            # Skip nalloc.h-based harnesses on Windows. nalloc.h is an oss-fuzz
+            # allocator-fault-injection helper that defines its OWN
+            # malloc/calloc/realloc/free interceptors and wraps the POSIX read()
+            # syscall. Under clang-cl those clash with the ASAN allocator
+            # interceptors (LNK2005: malloc already defined) and reference
+            # __interceptor_read (LNK2019, POSIX-only), so the harnesses that
+            # include nalloc.h cannot link on Windows. The rest (e.g.
+            # libpng_colormap_fuzzer) build and run fine, so skip selectively
+            # rather than dropping the whole Windows libfuzzer leg. Linux builds
+            # every harness unchanged.
+            if [ "$RUNNER_OS" = "Windows" ] && grep -q 'nalloc\.h' "$h"; then
+              echo "skip on Windows (nalloc.h POSIX allocator interceptors): $(basename "$h")"
+              continue
+            fi
             name=$(basename "${h%.cc}")
             if [ "$RUNNER_OS" = "Windows" ]; then
               "$CXX" $FUZZ_CFLAGS $CXX_EXTRA "$h" obj-fuzz/*.obj "$ZLIBLIB" \
