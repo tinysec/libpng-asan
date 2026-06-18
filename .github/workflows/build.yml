@@ -143,7 +143,15 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
-          BIN=$(ls out/png_libfuzzer_fuzzer out/png_libfuzzer_fuzzer.exe 2>/dev/null | head -1)
+          # Pick whichever binary name this OS produced (no suffix on Linux,
+          # .exe on Windows). Test each candidate explicitly rather than `ls`ing
+          # both paths -- `ls a b` exits 2 when one path is missing, which under
+          # `set -e -o pipefail` would abort the step even though the binary
+          # built fine.
+          BIN=""
+          for cand in out/png_libfuzzer_fuzzer out/png_libfuzzer_fuzzer.exe; do
+            if [ -f "$cand" ]; then BIN="$cand"; break; fi
+          done
           "$BIN" -runs=1 >/dev/null 2>&1 || true
 
       - name: Upload artifacts
