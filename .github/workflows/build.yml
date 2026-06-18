@@ -122,30 +122,19 @@ jobs:
             echo "FUZZ_LINKFLAGS=-fsanitize=fuzzer,address /DEBUG" >> "$GITHUB_ENV"
             echo "CXX_EXTRA=/EHsc" >> "$GITHUB_ENV"
 
-            # The shared library (png_shared.dll) is ASAN-instrumented, so its
-            # link must resolve the static ASAN runtime (__asan_set_shadow_*).
-            # clang-cl as the link driver does not reliably add the STATIC
-            # runtime for a DLL, so provide it explicitly as a FULL ABSOLUTE
-            # PATH on the link line. CMake space-splits linker flags and the
-            # runtime's home ("C:\Program Files\...") contains a space, so copy
-            # the runtime into the space-free GHA workspace and pass its
-            # forward-slash absolute path; lld-link loads an absolute path
-            # directly, no name resolution needed.
-            # Try both Windows runtime names: the canonical clang_rt.asan-
-            # x86_64.lib and the clang_rt.asan_static-x86_64.lib variant.
-            # -print-file-name echoes the query back unchanged when the file is
-            # absent, so reject that case explicitly.
-            ASAN_RT=""
-            for rtname in clang_rt.asan_static-x86_64.lib clang_rt.asan-x86_64.lib; do
-              cand=$("$CLANG_CL" -print-file-name="$rtname")
-              if [ "$cand" != "$rtname" ] && [ -f "$cand" ]; then
-                ASAN_RT="$cand"; break
-              fi
-            done
-            test -n "$ASAN_RT" || { echo "ASAN static runtime not found via $CLANG_CL"; exit 1; }
-            cp "$ASAN_RT" "$GITHUB_WORKSPACE/asan_static_rt.lib"
-            WS_FWD=$(echo "$GITHUB_WORKSPACE" | sed 's|\\|/|g')
-            echo "ASAN_LDFLAGS=/DEBUG ${WS_FWD}/asan_static_rt.lib" >> "$GITHUB_ENV"
+            # Let clang-cl link the ASAN runtime itself via -fsanitize=address.
+            # The link driver resolves the runtime from its OWN resource dir
+            # (computed from this clang-cl.exe's location), so it always matches
+            # the complete LLVM install -- unlike -print-file-name, which echoes
+            # the bare name back for the MSVC-ABI sanitizer runtimes and is
+            # unreliable here. This is the standard, supported clang-cl ASAN
+            # path and works for the DLL (png_shared.dll) and the fuzz exes
+            # alike. CMake also forwards CMAKE_C_FLAGS_INIT (which carries
+            # -fsanitize=address) to the link step, so the fuzz exes get the
+            # runtime even though their link line is driven manually.
+            # Confirm the runtime files are present on disk for sanity.
+            ls -la "C:/Program Files/LLVM"/lib/clang/*/lib/windows/ 2>/dev/null | head -40 || true
+            echo "ASAN_LDFLAGS=-fsanitize=address /DEBUG" >> "$GITHUB_ENV"
           else
             echo "CC=clang" >> "$GITHUB_ENV"
             echo "CXX=clang++" >> "$GITHUB_ENV"
