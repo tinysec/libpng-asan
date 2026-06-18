@@ -194,14 +194,14 @@ jobs:
           # EXE would fail with undefined __asan_init because the runtime is not
           # on the try-compile link line.
           ZEXTRA+=(-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY)
-          # zlib builds a shared zlibd.dll (Windows) / libz.so (Linux) in
-          # addition to the static lib we actually link against. The
-          # ASAN-instrumented shared lib needs the ASAN runtime at link time:
-          # undefined symbols are tolerated in a Linux .so (resolved at load)
-          # but are a hard link error for a Windows DLL, so feed the runtime to
-          # zlib's shared/exe link flags here.
-          ZEXTRA+=(-DCMAKE_SHARED_LINKER_FLAGS_INIT="$ASAN_LDFLAGS")
-          ZEXTRA+=(-DCMAKE_EXE_LINKER_FLAGS_INIT="$ASAN_LDFLAGS")
+          # Build zlib STATIC. The libfuzzer pass links zlib directly into each
+          # self-contained fuzz exe, so it needs a static archive (no zlib DLL
+          # to drag along). On Windows, zlib's MSVC default builds the SHARED
+          # lib (zlibd.dll + zlibd.lib import) and installs ONLY that, so the
+          # libfuzzer link then fails LNK1181 on zlibstatic.lib. Forcing STATIC
+          # guarantees an archive; find_package(ZLIB) in the asan pass then
+          # links that static zlib into png_shared.dll (baked in -- fine).
+          ZEXTRA+=(-DBUILD_SHARED_LIBS=OFF)
           # Resolve the install dir as a NATIVE path BEFORE handing it to cmake.
           # Git-Bash $PWD is the MSYS form (/d/a/...). MSYS path translation
           # skips values embedded in a -DVAR=... arg, so native cmake.exe would
@@ -220,6 +220,17 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$ZROOT"
           cmake --build zlib-build --target install
           echo "ZLIB_INSTALL=$ZROOT" >> "$GITHUB_ENV"
+          # The static archive's name varies by platform/MSVC config
+          # (zlibstatic.lib / zlib.lib on Windows, libz.a on Linux), so glob it
+          # out of the install lib dir instead of hardcoding. Export the path so
+          # the libfuzzer pass links the real file regardless of the exact name.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ZLIB_STATIC=$(ls "$ZROOT"/lib/zlibstatic.lib "$ZROOT"/lib/zlib.lib 2>/dev/null | head -1)
+          else
+            ZLIB_STATIC=$(ls "$ZROOT"/lib/libz.a "$ZROOT"/lib/libzstatic.a 2>/dev/null | head -1)
+          fi
+          test -n "$ZLIB_STATIC" || { echo "static zlib not found in $ZROOT/lib"; ls -la "$ZROOT/lib"; exit 1; }
+          echo "ZLIB_STATIC=$ZLIB_STATIC" >> "$GITHUB_ENV"
 
       # ----------------------------------------------------------------------
       # PASS A: ASAN static + dynamic libraries (clean, no fuzzer coverage).
@@ -289,14 +300,12 @@ jobs:
           mkdir -p "$GENINC"
           cp src/scripts/pnglibconf.h.prebuilt "$GENINC/pnglibconf.h"
 
-          # Link the ASAN-matched zlib built earlier (zlibstatic.lib on Windows,
-          # libz.a on Linux). No reliance on a system lib.
+          # Link the ASAN-matched STATIC zlib built earlier. ZLIB_STATIC was
+          # resolved by glob (zlibstatic.lib / zlib.lib / libz.a) so this works
+          # regardless of the exact archive name the platform produced. No
+          # reliance on a system lib.
           ZLIBINC="$ZLIB_INSTALL/include"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            ZLIBLIB="$ZLIB_INSTALL/lib/zlibstatic.lib"
-          else
-            ZLIBLIB="$ZLIB_INSTALL/lib/libz.a"
-          fi
+          ZLIBLIB="$ZLIB_STATIC"
 
           # The portable C core of libpng, compiled with ASAN + fuzzer coverage.
           PNG_SRCS="src/png.c src/pngerror.c src/pngget.c src/pngmem.c src/pngpread.c \
