@@ -189,6 +189,14 @@ jobs:
         run: |
           mkdir -p obj-fuzz out/fuzz
 
+          # pnglibconf.h is the generated feature-config header that png.h
+          # includes. This pass skips CMake (upstream libpng has no WITH_FUZZ),
+          # so reuse the canonical prebuilt config shipped in the tree -- the
+          # same one oss-fuzz libpng builds rely on.
+          GENINC=geninclude
+          mkdir -p "$GENINC"
+          cp src/scripts/pnglibconf.h.prebuilt "$GENINC/pnglibconf.h"
+
           # Resolve the zlib lib/include for the link step (Windows only).
           ZLIBLIB=""
           ZLIBINC=""
@@ -205,9 +213,9 @@ jobs:
           for c in $PNG_SRCS; do
             base=$(basename "${c%.c}")
             if [ "$RUNNER_OS" = "Windows" ]; then
-              "$CC" -c $FUZZ_CFLAGS "$c" -I src -I "$ZLIBINC" -o "obj-fuzz/${base}.${OBJEXT}"
+              "$CC" -c $FUZZ_CFLAGS "$c" -I "$GENINC" -I src -I "$ZLIBINC" -o "obj-fuzz/${base}.${OBJEXT}"
             else
-              "$CC" -c $FUZZ_CFLAGS "$c" -I src -o "obj-fuzz/${base}.${OBJEXT}"
+              "$CC" -c $FUZZ_CFLAGS "$c" -I "$GENINC" -I src -o "obj-fuzz/${base}.${OBJEXT}"
             fi
           done
 
@@ -218,12 +226,12 @@ jobs:
             if [ "$RUNNER_OS" = "Windows" ]; then
               "$CXX" $FUZZ_CFLAGS $CXX_EXTRA "$h" obj-fuzz/*.obj "$ZLIBLIB" \
                 $FUZZ_LINKFLAGS \
-                -I src -I src/contrib/oss-fuzz -I "$ZLIBINC" \
+                -I "$GENINC" -I src -I src/contrib/oss-fuzz -I "$ZLIBINC" \
                 -o "out/fuzz/${name}.exe"
             else
               "$CXX" $FUZZ_CFLAGS $CXX_EXTRA "$h" obj-fuzz/*.o \
                 $FUZZ_LINKFLAGS -lz \
-                -I src -I src/contrib/oss-fuzz \
+                -I "$GENINC" -I src -I src/contrib/oss-fuzz \
                 -o "out/fuzz/${name}"
             fi
           done
