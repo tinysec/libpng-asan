@@ -202,18 +202,23 @@ jobs:
           # zlib's shared/exe link flags here.
           ZEXTRA+=(-DCMAKE_SHARED_LINKER_FLAGS_INIT="$ASAN_LDFLAGS")
           ZEXTRA+=(-DCMAKE_EXE_LINKER_FLAGS_INIT="$ASAN_LDFLAGS")
-          cmake -S zlib-src -B zlib-build -G Ninja "${ZEXTRA[@]}" \
-            -DCMAKE_INSTALL_PREFIX="$PWD/zlib-install"
-          cmake --build zlib-build --target install
-          # Store the install dir as a NATIVE path. Git-Bash $PWD is the MSYS
-          # form (/d/a/...), which CMake tolerates but native clang-cl cannot
-          # read -- and the libfuzzer pass links png objects + zlib via clang-cl
-          # DIRECTLY (not through CMake), so a /d/a/... path there fails with
-          # 'clang-cl: no such file or directory'. cygpath -m yields a mixed
-          # D:/a/... path that both CMake and clang-cl accept. On Linux $PWD is
-          # already native, so no conversion is needed.
+          # Resolve the install dir as a NATIVE path BEFORE handing it to cmake.
+          # Git-Bash $PWD is the MSYS form (/d/a/...). MSYS path translation
+          # skips values embedded in a -DVAR=... arg, so native cmake.exe would
+          # receive the literal /d/a/... and read it as <currentdrive>:/d/a/...
+          # = D:/d/a/... -- a DOUBLED, bogus path OUTSIDE the real workspace
+          # (D:/a/...). zlib then installs to that bogus location while every
+          # downstream reference points at the real D:/a/... path, so
+          # find_package(ZLIB) and the clang-cl fuzz link both miss it. cygpath
+          # -m yields the mixed D:/a/... form that both cmake and clang-cl read
+          # correctly; use it for BOTH the install prefix and the exported var
+          # so install location and lookup location always agree. On Linux $PWD
+          # is already native, so no conversion is needed.
           ZROOT="$PWD/zlib-install"
           if [ "$RUNNER_OS" = "Windows" ]; then ZROOT=$(cygpath -m "$ZROOT"); fi
+          cmake -S zlib-src -B zlib-build -G Ninja "${ZEXTRA[@]}" \
+            -DCMAKE_INSTALL_PREFIX="$ZROOT"
+          cmake --build zlib-build --target install
           echo "ZLIB_INSTALL=$ZROOT" >> "$GITHUB_ENV"
 
       # ----------------------------------------------------------------------
