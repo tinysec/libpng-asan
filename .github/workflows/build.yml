@@ -122,19 +122,40 @@ jobs:
             echo "FUZZ_LINKFLAGS=-fsanitize=fuzzer,address /DEBUG" >> "$GITHUB_ENV"
             echo "CXX_EXTRA=/EHsc" >> "$GITHUB_ENV"
 
-            # Let clang-cl link the ASAN runtime itself via -fsanitize=address.
-            # The link driver resolves the runtime from its OWN resource dir
-            # (computed from this clang-cl.exe's location), so it always matches
-            # the complete LLVM install -- unlike -print-file-name, which echoes
-            # the bare name back for the MSVC-ABI sanitizer runtimes and is
-            # unreliable here. This is the standard, supported clang-cl ASAN
-            # path and works for the DLL (png_shared.dll) and the fuzz exes
-            # alike. CMake also forwards CMAKE_C_FLAGS_INIT (which carries
-            # -fsanitize=address) to the link step, so the fuzz exes get the
-            # runtime even though their link line is driven manually.
-            # Confirm the runtime files are present on disk for sanity.
-            ls -la "C:/Program Files/LLVM"/lib/clang/*/lib/windows/ 2>/dev/null | head -40 || true
-            echo "ASAN_LDFLAGS=-fsanitize=address /DEBUG" >> "$GITHUB_ENV"
+            # The shipped Windows LLVM (20.1.x) provides ONLY the DYNAMIC ASAN
+            # runtime: clang_rt.asan_dynamic-x86_64.dll + its import lib + the
+            # /MT and /MD CRT thunks. The STATIC clang_rt.asan-x86_64.lib is NOT
+            # shipped for the MSVC ABI (a long-standing gap), so the static-ASAN
+            # link fails with undefined __asan_* symbols. Use the DYNAMIC model.
+            # SECOND gotcha: CMake links DLLs/exes via `cmake -E vs_link_* ...
+            # lld-link`, NOT through the clang-cl driver, so -fsanitize=address on
+            # the link line is SILENTLY IGNORED by lld-link and the runtime is
+            # never auto-linked. The runtime MUST therefore be passed as explicit
+            # input libs on every CMake-driven link (zlib's shared DLL,
+            # png_shared.dll). clang_rt.asan_dynamic-x86_64.lib (import lib)
+            # resolves the __asan_* references; /wholearchive on the /MT CRT thunk
+            # forces the ASAN initializer to be pulled so checks actually run at
+            # runtime. (The libpng fuzz-harness link runs clang-cl DIRECTLY, where
+            # -fsanitize=fuzzer,address DOES auto-link -- left untouched.) Copy
+            # the libs into the space-free workspace (CMake space-splits linker
+            # flags and "Program Files" has a space) and ship the ASAN DLL too.
+            LLVM_RT_DIR="C:/Program Files/LLVM/lib/clang"
+            ASAN_DYN_IMPORT=""; ASAN_THUNK=""; ASAN_DLL=""
+            for d in "$LLVM_RT_DIR"/*/lib/windows; do
+              if [ -f "$d/clang_rt.asan_dynamic-x86_64.lib" ]; then ASAN_DYN_IMPORT="$d/clang_rt.asan_dynamic-x86_64.lib"; fi
+              if [ -f "$d/clang_rt.asan_static_runtime_thunk-x86_64.lib" ]; then ASAN_THUNK="$d/clang_rt.asan_static_runtime_thunk-x86_64.lib"; fi
+              if [ -f "$d/clang_rt.asan_dynamic-x86_64.dll" ]; then ASAN_DLL="$d/clang_rt.asan_dynamic-x86_64.dll"; fi
+            done
+            if [ -z "$ASAN_DYN_IMPORT" ] || [ -z "$ASAN_THUNK" ]; then
+              echo "dynamic ASAN runtime not found under $LLVM_RT_DIR"
+              ls -la "$LLVM_RT_DIR"/*/lib/windows/ 2>/dev/null
+              exit 1
+            fi
+            WS_FWD=$(echo "$GITHUB_WORKSPACE" | sed 's|\\|/|g')
+            cp "$ASAN_DYN_IMPORT" "$GITHUB_WORKSPACE/asan_dynamic.lib"
+            cp "$ASAN_THUNK" "$GITHUB_WORKSPACE/asan_thunk.lib"
+            echo "ASAN_DLL=$ASAN_DLL" >> "$GITHUB_ENV"
+            echo "ASAN_LDFLAGS=${WS_FWD}/asan_dynamic.lib /wholearchive:${WS_FWD}/asan_thunk.lib /DEBUG" >> "$GITHUB_ENV"
           else
             echo "CC=clang" >> "$GITHUB_ENV"
             echo "CXX=clang++" >> "$GITHUB_ENV"
@@ -224,6 +245,10 @@ jobs:
           cp build-asan/pnglibconf.h out/lib/include/ 2>/dev/null || true
           # Ship the ASAN-matched zlib headers so a downstream harness compiles.
           cp "$ZLIB_INSTALL"/include/zlib.h "$ZLIB_INSTALL"/include/zconf.h out/lib/include/ 2>/dev/null || true
+          # Ship the dynamic ASAN runtime DLL: the ASAN-instrumented png_shared.dll
+          # imports __asan_* from it, so it must sit beside the lib to run. Windows
+          # only -- ASAN_DLL is empty on Linux.
+          if [ -n "$ASAN_DLL" ]; then cp "$ASAN_DLL" out/lib/; fi
           ls -la out/lib out/lib/include
 
       # ----------------------------------------------------------------------
@@ -284,6 +309,10 @@ jobs:
 
           # Ship the fuzzer dictionary alongside the binaries.
           cp src/contrib/oss-fuzz/png.dict out/fuzz/ 2>/dev/null || true
+          # Ship the dynamic ASAN runtime DLL beside the fuzz exes: they are
+          # ASAN-instrumented (-fsanitize=fuzzer,address) and import __asan_* from
+          # this DLL at runtime. Windows only -- ASAN_DLL is empty on Linux.
+          if [ -n "$ASAN_DLL" ]; then cp "$ASAN_DLL" out/fuzz/; fi
           ls -la out/fuzz
 
       - name: Verify artifacts
