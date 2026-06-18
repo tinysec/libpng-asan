@@ -61,21 +61,28 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build zlib1g-dev git ca-certificates curl clang
+            build-essential cmake ninja-build git ca-certificates curl clang
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           # clang-cl and cmake are preinstalled on windows-latest; ninja is not.
-          # zlib is built from source rather than via vcpkg: on current images
-          # VCPKG_ROOT points at an empty VS-bundled clone, so vcpkg lookups fail.
           choco install ninja -y --no-progress
 
       - name: Fetch upstream libpng source (Chrome-vendored release)
         shell: bash
         run: |
           git clone --depth 1 --branch "v${{ steps.ver.outputs.libpng_version }}" "$UPSTREAM_REPO" src
+
+      # MSVC env is set up BEFORE the toolchain step so that LIB is already
+      # populated when the toolchain step prepends the ASAN runtime directory
+      # to it (lld-link searches LIB for the runtime).
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Resolve the ASAN + libFuzzer toolchain
         shell: bash
@@ -85,17 +92,32 @@ jobs:
           #   FUZZ_*  -> libFuzzer pass: ASAN + SanitizerCoverage (fuzzer-no-link)
           #              on the lib/harness, then -fsanitize=fuzzer at link pulls
           #              libFuzzer's main() and engine.
-          # /MT pins the static CRT so lib objects, the from-source zlib, and the
-          # ASAN/libFuzzer runtimes all share one CRT (required for clang-cl).
+          # /MT must live in the flags themselves (not only via
+          # CMAKE_MSVC_RUNTIME_LIBRARY): the runtime-library property applies to
+          # real targets but NOT to CMake's try_compile/check_* probes, so those
+          # probes would otherwise compile with the default /MD, which clang-cl
+          # rejects under -fsanitize=address ("ASAN requires static CRT").
           if [ "$RUNNER_OS" = "Windows" ]; then
             echo "CC=clang-cl" >> "$GITHUB_ENV"
             echo "CXX=clang-cl" >> "$GITHUB_ENV"
             echo "OBJEXT=obj" >> "$GITHUB_ENV"
             echo "ASAN_CFLAGS=-fsanitize=address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
-            echo "ASAN_LDFLAGS=-fsanitize=address /DEBUG" >> "$GITHUB_ENV"
             echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
             echo "FUZZ_LINKFLAGS=-fsanitize=fuzzer,address /DEBUG" >> "$GITHUB_ENV"
             echo "CXX_EXTRA=/EHsc" >> "$GITHUB_ENV"
+
+            # The shared library (png_shared.dll) is ASAN-instrumented, so its
+            # link must resolve the static ASAN runtime (__asan_set_shadow_* and
+            # friends). clang-cl as the link driver does not reliably add the
+            # STATIC runtime for a DLL, so provide it explicitly: prepend the
+            # runtime's directory to LIB (lld-link's lib search path) and name
+            # the lib in the shared-link flags. -fsanitize=address is dropped
+            # from the link so clang-cl does not add a second (dynamic) runtime;
+            # the explicit static lib is the single source of the ASAN symbols.
+            ASAN_RT=$(clang-cl -print-file-name=clang_rt.asan_static-x86_64.lib)
+            ASAN_RTDIR=${ASAN_RT%clang_rt.asan_static-x86_64.lib}
+            echo "LIB=${ASAN_RTDIR};${LIB}" >> "$GITHUB_ENV"
+            echo "ASAN_LDFLAGS=/DEBUG clang_rt.asan_static-x86_64.lib" >> "$GITHUB_ENV"
           else
             echo "CC=clang" >> "$GITHUB_ENV"
             echo "CXX=clang++" >> "$GITHUB_ENV"
@@ -107,24 +129,25 @@ jobs:
             echo "CXX_EXTRA=" >> "$GITHUB_ENV"
           fi
 
-      - name: Set up MSVC environment (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Build zlib from source (Windows)
-        if: runner.os == 'Windows'
+      - name: Build zlib from source (ASAN-matched)
         shell: bash
         env:
           MSYS_NO_PATHCONV: "1"
         run: |
-          # Build zlib locally with the static CRT (/MT) so it shares one CRT
-          # with the clang-cl ASAN libpng objects (required for clang-cl ASAN).
+          # Build zlib with the SAME ASAN toolchain + CRT as libpng so the
+          # dependency shares one runtime. On Linux this also fixes CMake
+          # FindZLIB (which found the system headers but not the .so); on
+          # Windows there is no system zlib usable by clang-cl. Both passes
+          # (asan and libfuzzer) link this exact zlib.
           git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git zlib-src
-          cmake -S zlib-src -B zlib-build -G Ninja \
-            -DCMAKE_C_COMPILER=clang-cl \
-            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+          ZEXTRA=()
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ZEXTRA+=(-DCMAKE_C_COMPILER=clang-cl -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
+          else
+            ZEXTRA+=(-DCMAKE_C_COMPILER="$CC")
+          fi
+          ZEXTRA+=(-DCMAKE_C_FLAGS_INIT="$ASAN_CFLAGS")
+          cmake -S zlib-src -B zlib-build -G Ninja "${ZEXTRA[@]}" \
             -DCMAKE_INSTALL_PREFIX="$PWD/zlib-install"
           cmake --build zlib-build --target install
           echo "ZLIB_INSTALL=$PWD/zlib-install" >> "$GITHUB_ENV"
@@ -140,12 +163,9 @@ jobs:
         run: |
           mkdir -p out/lib/include
 
-          EXTRA_ARGS=()
+          EXTRA_ARGS=(-DZLIB_ROOT="$ZLIB_INSTALL")
           if [ "$RUNNER_OS" = "Windows" ]; then
-            EXTRA_ARGS+=(
-              -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
-              -DZLIB_ROOT="$ZLIB_INSTALL"
-            )
+            EXTRA_ARGS+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
           fi
 
           # PNG_SHARED=ON + PNG_STATIC=ON produce both libraries. PNG_TESTS and
@@ -172,9 +192,8 @@ jobs:
             \) -exec cp {} out/lib/ \;
           cp src/png.h src/pngconf.h out/lib/include/ 2>/dev/null || true
           cp build-asan/pnglibconf.h out/lib/include/ 2>/dev/null || true
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cp "$ZLIB_INSTALL"/include/zlib.h "$ZLIB_INSTALL"/include/zconf.h out/lib/include/ 2>/dev/null || true
-          fi
+          # Ship the ASAN-matched zlib headers so a downstream harness compiles.
+          cp "$ZLIB_INSTALL"/include/zlib.h "$ZLIB_INSTALL"/include/zconf.h out/lib/include/ 2>/dev/null || true
           ls -la out/lib out/lib/include
 
       # ----------------------------------------------------------------------
@@ -197,12 +216,13 @@ jobs:
           mkdir -p "$GENINC"
           cp src/scripts/pnglibconf.h.prebuilt "$GENINC/pnglibconf.h"
 
-          # Resolve the zlib lib/include for the link step (Windows only).
-          ZLIBLIB=""
-          ZLIBINC=""
+          # Link the ASAN-matched zlib built earlier (zlibstatic.lib on Windows,
+          # libz.a on Linux). No reliance on a system lib.
+          ZLIBINC="$ZLIB_INSTALL/include"
           if [ "$RUNNER_OS" = "Windows" ]; then
             ZLIBLIB="$ZLIB_INSTALL/lib/zlibstatic.lib"
-            ZLIBINC="$ZLIB_INSTALL/include"
+          else
+            ZLIBLIB="$ZLIB_INSTALL/lib/libz.a"
           fi
 
           # The portable C core of libpng, compiled with ASAN + fuzzer coverage.
@@ -212,11 +232,7 @@ jobs:
 
           for c in $PNG_SRCS; do
             base=$(basename "${c%.c}")
-            if [ "$RUNNER_OS" = "Windows" ]; then
-              "$CC" -c $FUZZ_CFLAGS "$c" -I "$GENINC" -I src -I "$ZLIBINC" -o "obj-fuzz/${base}.${OBJEXT}"
-            else
-              "$CC" -c $FUZZ_CFLAGS "$c" -I "$GENINC" -I src -o "obj-fuzz/${base}.${OBJEXT}"
-            fi
+            "$CC" -c $FUZZ_CFLAGS "$c" -I "$GENINC" -I src -I "$ZLIBINC" -o "obj-fuzz/${base}.${OBJEXT}"
           done
 
           # Each upstream oss-fuzz harness -> one self-contained libFuzzer exe.
@@ -229,9 +245,9 @@ jobs:
                 -I "$GENINC" -I src -I src/contrib/oss-fuzz -I "$ZLIBINC" \
                 -o "out/fuzz/${name}.exe"
             else
-              "$CXX" $FUZZ_CFLAGS $CXX_EXTRA "$h" obj-fuzz/*.o \
-                $FUZZ_LINKFLAGS -lz \
-                -I "$GENINC" -I src -I src/contrib/oss-fuzz \
+              "$CXX" $FUZZ_CFLAGS $CXX_EXTRA "$h" obj-fuzz/*.o "$ZLIBLIB" \
+                $FUZZ_LINKFLAGS \
+                -I "$GENINC" -I src -I src/contrib/oss-fuzz -I "$ZLIBINC" \
                 -o "out/fuzz/${name}"
             fi
           done
