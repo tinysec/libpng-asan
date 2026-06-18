@@ -13,8 +13,6 @@ env:
   # Chrome's libpng fork. The Chrome-locked SHA lives in chrome.lock (written by
   # track.yml) so the default token can push bumps without touching this file.
   REPO: https://chromium.googlesource.com/chromium/src/third_party/libpng.git
-  OSS_FUZZ_HARNESS_URL: https://raw.githubusercontent.com/google/oss-fuzz/master/projects/libpng/libpng_read_fuzzer.c
-  AFL_BRANCH: stable
 
 jobs:
   build:
@@ -23,12 +21,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # libFuzzer only. AFL++ (afl-clang-fast) is Linux-native and cannot run
+        # on Windows; Windows AFL++ fuzzing is handled separately via WinAFL.
         os: [ubuntu-latest, windows-latest]
-        engine: [libfuzzer, afl]
-        # AFL++ is Linux-native; there is no Windows AFL++ leg.
-        exclude:
-          - os: windows-latest
-            engine: afl
 
     steps:
       - name: Checkout this repository
@@ -45,14 +40,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build zlib1g-dev git ca-certificates curl \
-            aflplusplus clang
+            build-essential cmake ninja-build zlib1g-dev git ca-certificates curl clang
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # clang-cl, cmake, and vcpkg are preinstalled on windows-latest.
+          # clang-cl and cmake are preinstalled on windows-latest; vcpkg provides zlib.
           choco install ninja -y --no-progress
           vcpkg install zlib:x64-windows-static
 
@@ -63,46 +57,24 @@ jobs:
           git -C src fetch --depth 1 origin "${{ steps.lock.outputs.sha }}"
           git -C src checkout FETCH_HEAD
 
-      - name: Fetch upstream OSS-Fuzz harness (libpng_read_fuzzer)
+      - name: Resolve the libFuzzer toolchain
         shell: bash
         run: |
-          curl -fsSL "$OSS_FUZZ_HARNESS_URL" -o harness.c
-          grep -q "LLVMFuzzerTestOneInput" harness.c
-
-      - name: Resolve the fuzzing engine and toolchain
-        shell: bash
-        run: |
-          if [ "${{ matrix.engine }}" = "libfuzzer" ]; then
-            if [ "$RUNNER_OS" = "Windows" ]; then
-              echo "CC=clang-cl" >> "$GITHUB_ENV"
-            else
-              echo "CC=clang" >> "$GITHUB_ENV"
-            fi
-            # libpng is instrumented but does not pull in main(); the harness is
-            # compiled with -fsanitize=fuzzer so clang/clang-cl links the libFuzzer
-            # runtime (which supplies main()) for the right platform.
+          # The harness (src/contrib/oss-fuzz/libpng_read_fuzzer.cc) is C++, so a
+          # C++ compiler is required in addition to the C compiler that builds libpng.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "CC=clang-cl" >> "$GITHUB_ENV"
+            echo "CXX=clang-cl" >> "$GITHUB_ENV"
+            # /Zi + /DEBUG emit a side .pdb so ASAN stacks resolve to source.
+            echo "LIB_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi" >> "$GITHUB_ENV"
+            echo "HARNESS_CFLAGS=-fsanitize=fuzzer,address -g -O1 /Zi" >> "$GITHUB_ENV"
+            echo "HARNESS_EXTRA=-EHsc" >> "$GITHUB_ENV"
+          else
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
             echo "LIB_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1" >> "$GITHUB_ENV"
             echo "HARNESS_CFLAGS=-fsanitize=fuzzer,address -g -O1" >> "$GITHUB_ENV"
-            echo "HARNESS_LINK=" >> "$GITHUB_ENV"
-          else
-            # AFL++ (Linux only): afl-clang-fast instruments; its driver supplies main().
-            DRIVER=""
-            for p in /usr/lib/afl/afl_driver.o \
-                     /usr/lib/x86_64-linux-gnu/afl/afl_driver.o; do
-              if [ -f "$p" ]; then DRIVER="$p"; break; fi
-            done
-            if [ -z "$DRIVER" ]; then
-              curl -fsSL \
-                "https://raw.githubusercontent.com/AFLplusplus/AFLplusplus/${AFL_BRANCH}/utils/afl_driver.cpp" \
-                -o afl_driver.cpp
-              afl-clang-fast++ -O1 -g afl_driver.cpp -c -o afl_driver.o
-              DRIVER="$PWD/afl_driver.o"
-            fi
-            echo "AFL_USE_ASAN=1" >> "$GITHUB_ENV"
-            echo "CC=afl-clang-fast" >> "$GITHUB_ENV"
-            echo "LIB_CFLAGS=-g -O1" >> "$GITHUB_ENV"
-            echo "HARNESS_CFLAGS=-g -O1" >> "$GITHUB_ENV"
-            echo "HARNESS_LINK=$DRIVER" >> "$GITHUB_ENV"
+            echo "HARNESS_EXTRA=" >> "$GITHUB_ENV"
           fi
 
       - name: Set up MSVC environment (Windows)
@@ -130,45 +102,44 @@ jobs:
 
           cmake --build build
 
-      - name: Build the harness
+      - name: Build the harness (libpng_read_fuzzer.cc + libFuzzer main)
         shell: bash
         run: |
           mkdir -p out
-          # Link the libpng static lib by path so the name (libpng16.a vs png16.lib)
-          # and zlib source (system -lz vs vcpkg path) do not matter.
+          # Link the static lib by path so its name (libpng16.a vs png16.lib) and
+          # the zlib source (system -lz vs vcpkg path) do not matter.
           PNGLIB=$(ls build/libpng16.a build/libpng*.a build/png16.lib build/png*.lib 2>/dev/null | head -1)
 
           if [ "$RUNNER_OS" = "Linux" ]; then
-            "$CC" $HARNESS_CFLAGS harness.c $HARNESS_LINK \
+            "$CXX" $HARNESS_CFLAGS $HARNESS_EXTRA \
+              src/contrib/oss-fuzz/libpng_read_fuzzer.cc \
               "$PNGLIB" -lz \
-              -I src -I build \
-              -o "out/png_${{ matrix.engine }}_fuzzer"
+              -I src -I build -I src/contrib/oss-fuzz \
+              -o "out/png_libfuzzer_fuzzer"
           else
             ZLIBLIB=$(ls "$VCPKG_ROOT"/installed/x64-windows-static/lib/zlib*.lib 2>/dev/null | head -1)
             ZLIBINC="$VCPKG_ROOT/installed/x64-windows-static/include"
-            "$CC" $HARNESS_CFLAGS harness.c $HARNESS_LINK \
+            "$CXX" $HARNESS_CFLAGS $HARNESS_EXTRA \
+              src/contrib/oss-fuzz/libpng_read_fuzzer.cc \
               "$PNGLIB" "$ZLIBLIB" \
-              -I src -I build -I "$ZLIBINC" \
+              -I src -I build -I src/contrib/oss-fuzz -I "$ZLIBINC" \
               /DEBUG \
-              -o "out/png_${{ matrix.engine }}_fuzzer.exe"
+              -o "out/png_libfuzzer_fuzzer.exe"
           fi
+
+          # Ship the fuzzer dictionary alongside the binary.
+          cp src/contrib/oss-fuzz/png.dict out/png_libfuzzer.dict 2>/dev/null || true
 
       - name: Smoke test
         shell: bash
         run: |
-          # Resolve the actual binary; do not try to execute the Windows .pdb.
-          BIN=$(ls "out/png_${{ matrix.engine }}_fuzzer" \
-                     "out/png_${{ matrix.engine }}_fuzzer.exe" 2>/dev/null | head -1)
-          if [ "${{ matrix.engine }}" = "libfuzzer" ]; then
-            "$BIN" -runs=1 >/dev/null 2>&1 || true
-          else
-            "$BIN" </dev/null >/dev/null 2>&1 || true
-          fi
+          BIN=$(ls out/png_libfuzzer_fuzzer out/png_libfuzzer_fuzzer.exe 2>/dev/null | head -1)
+          "$BIN" -runs=1 >/dev/null 2>&1 || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: png-${{ matrix.engine }}-${{ runner.os }}
+          name: png-libfuzzer-${{ runner.os }}
           path: out/*
           if-no-files-found: error
 
