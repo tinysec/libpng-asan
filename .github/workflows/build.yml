@@ -228,7 +228,15 @@ jobs:
           # link) consume. We did not run `install`, so assemble it by hand.
           mkdir -p "$ZROOT/include" "$ZROOT/lib"
           cp zlib-src/zlib.h "$ZROOT/include/"
-          cp zlib-src/zconf.h "$ZROOT/include/"
+          # CMake's configure step renames the checked-in zlib-src/zconf.h to
+          # zconf.h.included ("because this file is included with zlib") and
+          # regenerates zconf.h in the BUILD dir, so copy it from there -- after
+          # configure zlib-src/zconf.h no longer exists.
+          if [ -f zlib-build/zconf.h ]; then
+            cp zlib-build/zconf.h "$ZROOT/include/"
+          else
+            echo "zconf.h missing in zlib-build"; ls -la zlib-build; exit 1
+          fi
 
           # Resolve the single static archive in the build tree. Only
           # zlibstatic was built, so exactly one match exists; the list covers
