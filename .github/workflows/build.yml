@@ -124,26 +124,30 @@ jobs:
 
             # The shipped Windows LLVM (20.1.x) provides ONLY the DYNAMIC ASAN
             # runtime: clang_rt.asan_dynamic-x86_64.dll + its import lib + the
-            # /MT and /MD CRT thunks. The STATIC clang_rt.asan-x86_64.lib is NOT
-            # shipped for the MSVC ABI (a long-standing gap), so the static-ASAN
-            # link fails with undefined __asan_* symbols. Use the DYNAMIC model.
-            # SECOND gotcha: CMake links DLLs/exes via `cmake -E vs_link_* ...
-            # lld-link`, NOT through the clang-cl driver, so -fsanitize=address on
-            # the link line is SILENTLY IGNORED by lld-link and the runtime is
-            # never auto-linked. The runtime MUST therefore be passed as explicit
-            # input libs on every CMake-driven link (zlib's shared DLL,
-            # png_shared.dll). clang_rt.asan_dynamic-x86_64.lib (import lib)
-            # resolves the __asan_* references; /wholearchive on the /MT CRT thunk
-            # forces the ASAN initializer to be pulled so checks actually run at
-            # runtime. (The libpng fuzz-harness link runs clang-cl DIRECTLY, where
-            # -fsanitize=fuzzer,address DOES auto-link -- left untouched.) Copy
-            # the libs into the space-free workspace (CMake space-splits linker
-            # flags and "Program Files" has a space) and ship the ASAN DLL too.
+            # DYNAMIC runtime thunk. The STATIC clang_rt.asan-x86_64.lib is NOT
+            # shipped for the MSVC ABI, so static-ASAN linking fails with
+            # undefined __asan_* symbols. Use the DYNAMIC model. SECOND gotcha:
+            # CMake links DLLs/exes via `cmake -E vs_link_* ... lld-link`, NOT
+            # through the clang-cl driver, so -fsanitize=address on the link line
+            # is SILENTLY IGNORED by lld-link and the runtime is never
+            # auto-linked. The runtime MUST therefore be passed as explicit input
+            # libs on every CMake driven link (zlib's shared DLL, png_shared.dll).
+            # clang_rt.asan_dynamic-x86_64.lib (import lib) resolves the __asan_*
+            # references; /wholearchive on the DYNAMIC runtime thunk forces the
+            # ASAN initializer + CRT allocator hooks (malloc/free) to be pulled
+            # so checks actually run at runtime. CRITICAL: pair the import lib
+            # with asan_DYNAMIC_runtime_thunk, NOT the static one -- the static
+            # thunk double-defines malloc/free against the dynamic import lib
+            # (lld-link: duplicate symbol: malloc/free). (The libpng fuzz-harness
+            # link runs clang-cl DIRECTLY, where -fsanitize=fuzzer,address DOES
+            # auto-link -- left untouched.) Copy the libs into the space-free
+            # workspace (CMake space-splits linker flags and "Program Files" has a
+            # space) and ship the ASAN DLL too.
             LLVM_RT_DIR="C:/Program Files/LLVM/lib/clang"
             ASAN_DYN_IMPORT=""; ASAN_THUNK=""; ASAN_DLL=""
             for d in "$LLVM_RT_DIR"/*/lib/windows; do
               if [ -f "$d/clang_rt.asan_dynamic-x86_64.lib" ]; then ASAN_DYN_IMPORT="$d/clang_rt.asan_dynamic-x86_64.lib"; fi
-              if [ -f "$d/clang_rt.asan_static_runtime_thunk-x86_64.lib" ]; then ASAN_THUNK="$d/clang_rt.asan_static_runtime_thunk-x86_64.lib"; fi
+              if [ -f "$d/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib" ]; then ASAN_THUNK="$d/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib"; fi
               if [ -f "$d/clang_rt.asan_dynamic-x86_64.dll" ]; then ASAN_DLL="$d/clang_rt.asan_dynamic-x86_64.dll"; fi
             done
             if [ -z "$ASAN_DYN_IMPORT" ] || [ -z "$ASAN_THUNK" ]; then
@@ -201,7 +205,16 @@ jobs:
           cmake -S zlib-src -B zlib-build -G Ninja "${ZEXTRA[@]}" \
             -DCMAKE_INSTALL_PREFIX="$PWD/zlib-install"
           cmake --build zlib-build --target install
-          echo "ZLIB_INSTALL=$PWD/zlib-install" >> "$GITHUB_ENV"
+          # Store the install dir as a NATIVE path. Git-Bash $PWD is the MSYS
+          # form (/d/a/...), which CMake tolerates but native clang-cl cannot
+          # read -- and the libfuzzer pass links png objects + zlib via clang-cl
+          # DIRECTLY (not through CMake), so a /d/a/... path there fails with
+          # 'clang-cl: no such file or directory'. cygpath -m yields a mixed
+          # D:/a/... path that both CMake and clang-cl accept. On Linux $PWD is
+          # already native, so no conversion is needed.
+          ZROOT="$PWD/zlib-install"
+          if [ "$RUNNER_OS" = "Windows" ]; then ZROOT=$(cygpath -m "$ZROOT"); fi
+          echo "ZLIB_INSTALL=$ZROOT" >> "$GITHUB_ENV"
 
       # ----------------------------------------------------------------------
       # PASS A: ASAN static + dynamic libraries (clean, no fuzzer coverage).
