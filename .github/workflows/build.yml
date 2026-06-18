@@ -6,12 +6,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Chrome version (e.g. 149.0.7827.156). Tags the release chrome-<version>. Leave empty for a build-only run."
+        description: "Chrome version (e.g. 150.0.7871.24). Tags the release chrome-<version>. Leave empty for a build-only run."
         required: false
 
 env:
   # Chrome's libpng fork. The Chrome-locked SHA lives in chrome.lock (written by
   # track.yml) so the default token can push bumps without touching this file.
+  # NOTE: Chrome's fork ships only BUILD.gn (no CMakeLists.txt), so we compile
+  # the shipped C sources directly rather than driving a CMake build.
   REPO: https://chromium.googlesource.com/chromium/src/third_party/libpng.git
 
 jobs:
@@ -40,14 +42,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build zlib1g-dev git ca-certificates curl clang
+            build-essential zlib1g-dev git ca-certificates curl clang
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # clang-cl and cmake are preinstalled on windows-latest; vcpkg provides zlib.
-          choco install ninja -y --no-progress
+          # clang-cl is preinstalled on windows-latest; vcpkg provides zlib.
           vcpkg install zlib:x64-windows-static
 
       - name: Fetch libpng source (Chrome-locked revision)
@@ -65,6 +66,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             echo "CC=clang-cl" >> "$GITHUB_ENV"
             echo "CXX=clang-cl" >> "$GITHUB_ENV"
+            echo "OBJEXT=obj" >> "$GITHUB_ENV"
             # /Zi + /DEBUG emit a side .pdb so ASAN stacks resolve to source.
             echo "LIB_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi" >> "$GITHUB_ENV"
             echo "HARNESS_CFLAGS=-fsanitize=fuzzer,address -g -O1 /Zi" >> "$GITHUB_ENV"
@@ -72,6 +74,7 @@ jobs:
           else
             echo "CC=clang" >> "$GITHUB_ENV"
             echo "CXX=clang++" >> "$GITHUB_ENV"
+            echo "OBJEXT=o" >> "$GITHUB_ENV"
             echo "LIB_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1" >> "$GITHUB_ENV"
             echo "HARNESS_CFLAGS=-fsanitize=fuzzer,address -g -O1" >> "$GITHUB_ENV"
             echo "HARNESS_EXTRA=" >> "$GITHUB_ENV"
@@ -83,46 +86,35 @@ jobs:
         with:
           arch: x64
 
-      - name: Build libpng static library
+      - name: Build libpng objects and the harness
         shell: bash
         run: |
-          EXTRA_ARGS=""
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            EXTRA_ARGS="-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static"
-          fi
+          mkdir -p obj out
 
-          cmake -S src -B build -G Ninja \
-            -DCMAKE_C_COMPILER="$CC" \
-            -DCMAKE_C_FLAGS_INIT="$LIB_CFLAGS" \
-            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
-            -DPNG_SHARED=OFF \
-            -DPNG_STATIC=ON \
-            -DPNG_TESTS=OFF \
-            $EXTRA_ARGS
+          # The portable C core of libpng (skip pngtest.c). The Chrome fork ships a
+          # ready-made pnglibconf.h at the root, so no config generation is needed.
+          PNG_SRCS="src/png.c src/pngerror.c src/pngget.c src/pngmem.c src/pngpread.c \
+            src/pngread.c src/pngrio.c src/pngrtran.c src/pngrutil.c src/pngset.c \
+            src/pngtrans.c src/pngwio.c src/pngwrite.c src/pngwtran.c src/pngwutil.c"
 
-          cmake --build build
-
-      - name: Build the harness (libpng_read_fuzzer.cc + libFuzzer main)
-        shell: bash
-        run: |
-          mkdir -p out
-          # Link the static lib by path so its name (libpng16.a vs png16.lib) and
-          # the zlib source (system -lz vs vcpkg path) do not matter.
-          PNGLIB=$(ls build/libpng16.a build/libpng*.a build/png16.lib build/png*.lib 2>/dev/null | head -1)
+          for c in $PNG_SRCS; do
+            base=$(basename "${c%.c}")
+            "$CC" -c $LIB_CFLAGS "$c" -I src -o "obj/${base}.${OBJEXT}"
+          done
 
           if [ "$RUNNER_OS" = "Linux" ]; then
             "$CXX" $HARNESS_CFLAGS $HARNESS_EXTRA \
               src/contrib/oss-fuzz/libpng_read_fuzzer.cc \
-              "$PNGLIB" -lz \
-              -I src -I build -I src/contrib/oss-fuzz \
+              obj/*.o -lz \
+              -I src -I src/contrib/oss-fuzz \
               -o "out/png_libfuzzer_fuzzer"
           else
             ZLIBLIB=$(ls "$VCPKG_ROOT"/installed/x64-windows-static/lib/zlib*.lib 2>/dev/null | head -1)
             ZLIBINC="$VCPKG_ROOT/installed/x64-windows-static/include"
             "$CXX" $HARNESS_CFLAGS $HARNESS_EXTRA \
               src/contrib/oss-fuzz/libpng_read_fuzzer.cc \
-              "$PNGLIB" "$ZLIBLIB" \
-              -I src -I build -I src/contrib/oss-fuzz -I "$ZLIBINC" \
+              obj/*.o "$ZLIBLIB" \
+              -I src -I src/contrib/oss-fuzz -I "$ZLIBINC" \
               /DEBUG \
               -o "out/png_libfuzzer_fuzzer.exe"
           fi
