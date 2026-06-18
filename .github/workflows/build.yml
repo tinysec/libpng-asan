@@ -48,8 +48,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # clang-cl is preinstalled on windows-latest; vcpkg provides zlib.
-          vcpkg install zlib:x64-windows-static
+          # clang-cl and the MSVC toolchain are preinstalled on windows-latest.
+          # ninja is needed to build zlib from source in a later Windows step.
+          # zlib is built from source rather than via vcpkg: on current images
+          # VCPKG_ROOT points at an empty VS-bundled clone, so a vcpkg install
+          # does not land where $VCPKG_ROOT expects.
+          choco install ninja -y --no-progress
 
       - name: Fetch libpng source (Chrome-locked revision)
         shell: bash
@@ -68,8 +72,11 @@ jobs:
             echo "CXX=clang-cl" >> "$GITHUB_ENV"
             echo "OBJEXT=obj" >> "$GITHUB_ENV"
             # /Zi + /DEBUG emit a side .pdb so ASAN stacks resolve to source.
-            echo "LIB_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi" >> "$GITHUB_ENV"
-            echo "HARNESS_CFLAGS=-fsanitize=fuzzer,address -g -O1 /Zi" >> "$GITHUB_ENV"
+            # /MT pins the static CRT so libpng objects, the harness, and the
+            # from-source zlib all share one CRT -- required for clang-cl ASAN on
+            # Windows. /Zi + /DEBUG emit a side .pdb so ASAN stacks resolve to src.
+            echo "LIB_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
+            echo "HARNESS_CFLAGS=-fsanitize=fuzzer,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
             echo "HARNESS_EXTRA=-EHsc" >> "$GITHUB_ENV"
           else
             echo "CC=clang" >> "$GITHUB_ENV"
@@ -85,6 +92,24 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+
+      - name: Build zlib from source (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          # Build zlib locally with the static CRT (/MT) so it shares one CRT
+          # with the clang-cl ASAN libpng objects and harness (required for
+          # clang-cl ASAN on Windows). From-source avoids the vcpkg/VCPKG_ROOT
+          # image-churn problem noted in the deps step.
+          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git zlib-src
+          cmake -S zlib-src -B zlib-build -G Ninja \
+            -DCMAKE_C_COMPILER=clang-cl \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DCMAKE_INSTALL_PREFIX="$PWD/zlib-install"
+          cmake --build zlib-build --target install
+          echo "ZLIB_INSTALL=$PWD/zlib-install" >> "$GITHUB_ENV"
 
       - name: Build libpng objects and the harness
         shell: bash
@@ -103,8 +128,8 @@ jobs:
           ZLIBLIB=""
           ZLIBINC=""
           if [ "$RUNNER_OS" = "Windows" ]; then
-            ZLIBLIB=$(ls "$VCPKG_ROOT"/installed/x64-windows-static/lib/zlib*.lib 2>/dev/null | head -1)
-            ZLIBINC="$VCPKG_ROOT/installed/x64-windows-static/include"
+            ZLIBLIB="$ZLIB_INSTALL/lib/zlibstatic.lib"
+            ZLIBINC="$ZLIB_INSTALL/include"
           fi
 
           # The portable C core of libpng (skip pngtest.c). The Chrome fork ships a
