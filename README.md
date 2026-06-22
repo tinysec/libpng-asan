@@ -12,12 +12,12 @@ ASAN-instrumented build of **Chrome's libpng** — the PNG decoder Chrome ships 
 ships. The [`track-chrome`](.github/workflows/track.yml) workflow runs every 6
 hours: it resolves the latest Chrome stable, walks Chrome DEPS → PDFium DEPS to
 find the libpng revision, and when it has changed it bumps `chrome.lock`, tags
-`chrome-<version>`, and triggers [`build`](.github/workflows/build.yml). Each
-`chrome-<version>` tag becomes a GitHub release.
+`libpng-<sha8>`, and triggers [`build`](.github/workflows/build.yml). Each
+`libpng-<sha8>` tag becomes a GitHub release.
 
 ## Release artifacts
 
-Each release is published at its `chrome-<version>` tag as one **zip per
+Each release is published at its `libpng-<sha8>` tag as one **zip per
 platform and build mode** (so every asset has a unique name and the directory
 structure is preserved). Each zip contains:
 
