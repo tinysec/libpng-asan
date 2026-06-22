@@ -437,9 +437,28 @@ jobs:
             echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Pack each artifact into a zip
+        # GitHub release assets are FLAT (a file's release path is just its
+        # basename, directory structure stripped). A direct flat upload of
+        # libpng's legs collides on cross-artifact duplicate basenames: the
+        # ASAN + libFuzzer legs on each OS share the public headers, and the
+        # cmake-GENERATED pnglibconf.h differs per platform, so a flat collapse
+        # would give one platform the wrong generated config. Packing each
+        # artifact into ONE per-platform zip keeps every asset uniquely named
+        # and preserves the per-platform config + the lib/+include/+fuzz/ tree
+        # the consumer needs. Matches the skia/pdfium/libjpeg release layout.
+        run: |
+          mkdir -p out
+          for d in artifacts/*/; do
+            name=$(basename "$d")
+            (cd artifacts && zip -rq "../out/${name}-${{ steps.tag.outputs.tag }}.zip" "$name")
+          done
+          echo "--- release zips ---"
+          ls -la out
+
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
-          files: artifacts/**/*
+          files: out/*.zip
